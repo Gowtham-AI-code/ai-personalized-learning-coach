@@ -1,4 +1,6 @@
-streamlit>=1.36.0
-google-genai>=1.0.0
-python-dotenv>=1.0.0
-pandas>=2.0.0
+streamlit>=1.35
+pandas>=2.0
+langchain>=0.3
+langchain-core>=0.3
+langchain-ollama>=0.2
+ollama>=0.3

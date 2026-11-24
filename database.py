@@ -1,253 +1,246 @@
-"""SQLite persistence layer for the AI Personalized Learning Coach.
-
-Every function opens a short-lived connection, so data written here is
-still available after the Streamlit app is restarted.
 """
+database.py - SQLite storage for requirements and generated test cases.
+
+Tables
+------
+requirements
+    id, requirement_text, feature_name, requirement_summary,
+    assumptions (JSON text), created_at
+
+test_cases   (many test cases belong to one requirement)
+    id, requirement_id -> requirements.id (ON DELETE CASCADE),
+    test_case_id, title, scenario_type, preconditions (JSON text),
+    steps (JSON text), test_data (JSON text), expected_result,
+    priority, created_at
+
+Lists and dictionaries are stored as JSON text. All functions raise
+DatabaseError (with a readable message) instead of raw sqlite3 errors.
+"""
+
 import json
-import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
+from typing import Optional
 
-DEFAULT_DB_PATH = "learning_coach.db"
+DB_PATH = Path(__file__).resolve().parent / "test_cases.db"
+
+EDITABLE_FIELDS = (
+    "title", "scenario_type", "preconditions", "steps",
+    "test_data", "expected_result", "priority",
+)
+_JSON_FIELDS = ("preconditions", "steps", "test_data")
 
 
 class DatabaseError(Exception):
-    """Raised when a database operation fails (wraps sqlite3.Error)."""
+    """Raised for any database problem."""
 
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS learners (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    subject       TEXT    NOT NULL,
-    goal          TEXT    NOT NULL,
-    level         TEXT    NOT NULL,
-    duration_days INTEGER NOT NULL,
-    daily_minutes INTEGER NOT NULL,
-    created_at    TEXT    NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS plans (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    learner_id INTEGER NOT NULL REFERENCES learners(id) ON DELETE CASCADE,
-    title      TEXT    NOT NULL,
-    summary    TEXT,
-    is_active  INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT    NOT NULL
-);
-
--- One row per study day/topic. Also holds the topic's performance + status.
-CREATE TABLE IF NOT EXISTS plan_days (
-    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
-    plan_id            INTEGER NOT NULL REFERENCES plans(id) ON DELETE CASCADE,
-    day_number         INTEGER NOT NULL,
-    topic              TEXT    NOT NULL,
-    objectives         TEXT    NOT NULL,           -- JSON list
-    estimated_minutes  INTEGER NOT NULL,
-    practice_activity  TEXT    NOT NULL,
-    status             TEXT    NOT NULL DEFAULT 'pending'
-        CHECK (status IN ('pending','in_progress','completed','needs_revision')),
-    attempts_count     INTEGER NOT NULL DEFAULT 0,
-    last_score         REAL,                       -- percentage 0-100
-    best_score         REAL,
-    last_attempt_at    TEXT,
-    UNIQUE (plan_id, day_number)
-);
-
-CREATE TABLE IF NOT EXISTS quizzes (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    plan_day_id INTEGER NOT NULL REFERENCES plan_days(id) ON DELETE CASCADE,
-    topic       TEXT    NOT NULL,
-    created_at  TEXT    NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS quiz_questions (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    quiz_id       INTEGER NOT NULL REFERENCES quizzes(id) ON DELETE CASCADE,
-    position      INTEGER NOT NULL,
-    question      TEXT    NOT NULL,
-    options       TEXT    NOT NULL,                -- JSON list
-    correct_index INTEGER NOT NULL,                -- the answer key
-    explanation   TEXT    NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS quiz_attempts (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    quiz_id     INTEGER NOT NULL REFERENCES quizzes(id) ON DELETE CASCADE,
-    plan_day_id INTEGER NOT NULL REFERENCES plan_days(id) ON DELETE CASCADE,
-    score       INTEGER NOT NULL,
-    total       INTEGER NOT NULL,
-    percentage  REAL    NOT NULL,
-    answers     TEXT    NOT NULL,                  -- JSON list of chosen indexes
-    taken_at    TEXT    NOT NULL
-);
-"""
-
-
-def _now():
-    return datetime.now().isoformat(timespec="seconds")
+def _now() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 @contextmanager
-def get_connection():
+def _connect(db_path=DB_PATH):
     """Open a connection, commit on success, roll back on error, always close."""
-    path = os.getenv("DB_PATH", DEFAULT_DB_PATH)
+    conn = None
     try:
-        conn = sqlite3.connect(path)
+        conn = sqlite3.connect(str(db_path), timeout=10)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
-        try:
-            yield conn
-            conn.commit()
-        except Exception:
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        yield conn
+        conn.commit()
     except sqlite3.Error as exc:
+        if conn is not None:
+            conn.rollback()
         raise DatabaseError(f"Database error: {exc}") from exc
+    finally:
+        if conn is not None:
+            conn.close()
 
 
-def init_db():
-    """Create all tables if they do not exist yet."""
-    with get_connection() as conn:
-        conn.executescript(SCHEMA)
-
-
-# ------------------------------------------------------------------ plans
-def create_learner(profile):
-    with get_connection() as conn:
-        cur = conn.execute(
-            "INSERT INTO learners (subject, goal, level, duration_days, daily_minutes, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (profile["subject"], profile["goal"], profile["level"],
-             int(profile["duration_days"]), int(profile["daily_minutes"]), _now()),
+# --------------------------------------------------------------------------
+# Create tables
+# --------------------------------------------------------------------------
+def init_db(db_path=DB_PATH) -> None:
+    """Create the tables if they do not exist yet."""
+    with _connect(db_path) as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS requirements (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                requirement_text    TEXT NOT NULL,
+                feature_name        TEXT NOT NULL,
+                requirement_summary TEXT NOT NULL DEFAULT '',
+                assumptions         TEXT NOT NULL DEFAULT '[]',
+                created_at          TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS test_cases (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                requirement_id   INTEGER NOT NULL,
+                test_case_id     TEXT NOT NULL,
+                title            TEXT NOT NULL,
+                scenario_type    TEXT NOT NULL CHECK (scenario_type IN ('Positive','Negative','Edge')),
+                preconditions    TEXT NOT NULL DEFAULT '[]',
+                steps            TEXT NOT NULL DEFAULT '[]',
+                test_data        TEXT NOT NULL DEFAULT '{}',
+                expected_result  TEXT NOT NULL,
+                priority         TEXT NOT NULL CHECK (priority IN ('High','Medium','Low')),
+                created_at       TEXT NOT NULL,
+                FOREIGN KEY (requirement_id) REFERENCES requirements(id) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_test_cases_requirement ON test_cases(requirement_id);
+            """
         )
-        return cur.lastrowid
 
 
-def save_plan(learner_id, plan):
-    """Save a validated plan; older plans become inactive (history is kept)."""
-    with get_connection() as conn:
-        conn.execute("UPDATE plans SET is_active = 0")
+# --------------------------------------------------------------------------
+# Row helpers
+# --------------------------------------------------------------------------
+def _insert_requirement(conn, requirement_text, feature_name, summary, assumptions) -> int:
+    cur = conn.execute(
+        "INSERT INTO requirements (requirement_text, feature_name, requirement_summary, assumptions, created_at) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (requirement_text, feature_name, summary, json.dumps(assumptions or [], ensure_ascii=False), _now()),
+    )
+    return cur.lastrowid
+
+
+def _insert_test_cases(conn, requirement_id: int, test_cases: list) -> list:
+    ids = []
+    for tc in test_cases:
         cur = conn.execute(
-            "INSERT INTO plans (learner_id, title, summary, is_active, created_at) VALUES (?, ?, ?, 1, ?)",
-            (learner_id, plan["title"], plan.get("summary", ""), _now()),
+            "INSERT INTO test_cases (requirement_id, test_case_id, title, scenario_type, preconditions, steps, "
+            "test_data, expected_result, priority, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                requirement_id, tc["test_case_id"], tc["title"], tc["scenario_type"],
+                json.dumps(tc["preconditions"], ensure_ascii=False),
+                json.dumps(tc["steps"], ensure_ascii=False),
+                json.dumps(tc["test_data"], ensure_ascii=False),
+                tc["expected_result"], tc["priority"], _now(),
+            ),
         )
-        plan_id = cur.lastrowid
-        for d in plan["days"]:
-            conn.execute(
-                "INSERT INTO plan_days (plan_id, day_number, topic, objectives, estimated_minutes, practice_activity) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (plan_id, d["day_number"], d["topic"], json.dumps(d["objectives"]),
-                 d["estimated_minutes"], d["practice_activity"]),
-            )
-        return plan_id
+        ids.append(cur.lastrowid)
+    return ids
 
 
-def get_active_plan():
-    """Return the newest active plan joined with its learner profile, or None."""
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT p.id, p.learner_id, p.title, p.summary, p.created_at, "
-            "l.subject, l.goal, l.level, l.duration_days, l.daily_minutes "
-            "FROM plans p JOIN learners l ON l.id = p.learner_id "
-            "WHERE p.is_active = 1 ORDER BY p.id DESC LIMIT 1"
-        ).fetchone()
-        return dict(row) if row else None
+def _row_to_test_case(row: sqlite3.Row) -> dict:
+    return {
+        "db_id": row["id"],
+        "test_case_id": row["test_case_id"],
+        "title": row["title"],
+        "scenario_type": row["scenario_type"],
+        "preconditions": json.loads(row["preconditions"]),
+        "steps": json.loads(row["steps"]),
+        "test_data": json.loads(row["test_data"]),
+        "expected_result": row["expected_result"],
+        "priority": row["priority"],
+    }
 
 
-def get_plan_days(plan_id):
-    with get_connection() as conn:
+# --------------------------------------------------------------------------
+# Save
+# --------------------------------------------------------------------------
+def save_requirement(requirement_text: str, feature_name: str, summary: str = "",
+                     assumptions: Optional[list] = None, db_path=DB_PATH) -> int:
+    """Save one requirement and return its new id."""
+    with _connect(db_path) as conn:
+        return _insert_requirement(conn, requirement_text, feature_name, summary, assumptions)
+
+
+def save_test_cases(requirement_id: int, test_cases: list, db_path=DB_PATH) -> list:
+    """Save test cases for an existing requirement. Returns the new database ids."""
+    with _connect(db_path) as conn:
+        return _insert_test_cases(conn, requirement_id, test_cases)
+
+
+def save_result(requirement_text: str, result: dict, db_path=DB_PATH) -> tuple:
+    """
+    Save a requirement and all its test cases in ONE transaction
+    (either everything is saved or nothing is).
+    Returns (requirement_id, [database ids of the test cases]).
+    """
+    with _connect(db_path) as conn:
+        req_id = _insert_requirement(
+            conn, requirement_text, result["feature_name"],
+            result.get("requirement_summary", ""), result.get("assumptions", []),
+        )
+        ids = _insert_test_cases(conn, req_id, result["test_cases"])
+    return req_id, ids
+
+
+# --------------------------------------------------------------------------
+# Read
+# --------------------------------------------------------------------------
+def get_history(db_path=DB_PATH) -> list:
+    """All saved requirements, newest first, with their test case counts."""
+    with _connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM plan_days WHERE plan_id = ? ORDER BY day_number", (plan_id,)
+            "SELECT r.id, r.requirement_text, r.feature_name, r.created_at, COUNT(t.id) AS test_case_count "
+            "FROM requirements r LEFT JOIN test_cases t ON t.requirement_id = r.id "
+            "GROUP BY r.id ORDER BY r.id DESC"
         ).fetchall()
-    days = []
-    for r in rows:
-        d = dict(r)
-        d["objectives"] = json.loads(d["objectives"])
-        days.append(d)
-    return days
+    return [dict(r) for r in rows]
 
 
-# ---------------------------------------------------------------- quizzes
-def save_quiz(plan_day_id, topic, questions):
-    with get_connection() as conn:
-        cur = conn.execute(
-            "INSERT INTO quizzes (plan_day_id, topic, created_at) VALUES (?, ?, ?)",
-            (plan_day_id, topic, _now()),
-        )
-        quiz_id = cur.lastrowid
-        for pos, q in enumerate(questions):
-            conn.execute(
-                "INSERT INTO quiz_questions (quiz_id, position, question, options, correct_index, explanation) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (quiz_id, pos, q["question"], json.dumps(q["options"]),
-                 q["correct_index"], q["explanation"]),
-            )
-        return quiz_id
+def get_test_cases(requirement_id: int, db_path=DB_PATH) -> list:
+    """All test cases of a requirement (each includes its 'db_id')."""
+    with _connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM test_cases WHERE requirement_id = ? ORDER BY id", (requirement_id,)
+        ).fetchall()
+    return [_row_to_test_case(r) for r in rows]
 
 
-def get_quiz(quiz_id):
-    with get_connection() as conn:
-        quiz = conn.execute("SELECT * FROM quizzes WHERE id = ?", (quiz_id,)).fetchone()
-        if not quiz:
+def load_result(requirement_id: int, db_path=DB_PATH) -> Optional[dict]:
+    """Load a saved requirement together with its test cases. Returns None if not found."""
+    with _connect(db_path) as conn:
+        req = conn.execute("SELECT * FROM requirements WHERE id = ?", (requirement_id,)).fetchone()
+        if req is None:
             return None
         rows = conn.execute(
-            "SELECT question, options, correct_index, explanation FROM quiz_questions "
-            "WHERE quiz_id = ? ORDER BY position", (quiz_id,)
+            "SELECT * FROM test_cases WHERE requirement_id = ? ORDER BY id", (requirement_id,)
         ).fetchall()
-    result = dict(quiz)
-    result["questions"] = [
-        {"question": r["question"], "options": json.loads(r["options"]),
-         "correct_index": r["correct_index"], "explanation": r["explanation"]}
-        for r in rows
-    ]
-    return result
+    return {
+        "requirement_id": req["id"],
+        "requirement_text": req["requirement_text"],
+        "feature_name": req["feature_name"],
+        "requirement_summary": req["requirement_summary"],
+        "assumptions": json.loads(req["assumptions"]),
+        "created_at": req["created_at"],
+        "test_cases": [_row_to_test_case(r) for r in rows],
+    }
 
 
-def save_attempt(quiz_id, plan_day_id, result, answers, new_status):
-    """Store one attempt and update the topic's performance + status."""
-    now = _now()
-    pct = result["percentage"]
-    with get_connection() as conn:
-        cur = conn.execute(
-            "INSERT INTO quiz_attempts (quiz_id, plan_day_id, score, total, percentage, answers, taken_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (quiz_id, plan_day_id, result["score"], result["total"], pct, json.dumps(answers), now),
-        )
-        conn.execute(
-            "UPDATE plan_days SET attempts_count = attempts_count + 1, last_score = ?, "
-            "best_score = CASE WHEN best_score IS NULL OR best_score < ? THEN ? ELSE best_score END, "
-            "status = ?, last_attempt_at = ? WHERE id = ?",
-            (pct, pct, pct, new_status, now, plan_day_id),
-        )
-        return cur.lastrowid
+# --------------------------------------------------------------------------
+# Update / delete
+# --------------------------------------------------------------------------
+def update_test_case(db_id: int, fields: dict, db_path=DB_PATH) -> bool:
+    """
+    Update the given fields of one test case.
+    Only EDITABLE_FIELDS are accepted. Returns True if a row was changed.
+    """
+    updates = {k: v for k, v in fields.items() if k in EDITABLE_FIELDS}
+    if not updates:
+        raise DatabaseError("No editable fields were provided.")
+    columns, values = [], []
+    for name, value in updates.items():
+        columns.append(f"{name} = ?")
+        values.append(json.dumps(value, ensure_ascii=False) if name in _JSON_FIELDS else value)
+    values.append(db_id)
+    with _connect(db_path) as conn:
+        cur = conn.execute(f"UPDATE test_cases SET {', '.join(columns)} WHERE id = ?", values)
+        return cur.rowcount > 0
 
 
-def get_attempts(plan_id=None):
-    """All attempts (newest first). Pass plan_id to filter to one plan."""
-    sql = (
-        "SELECT a.id, a.quiz_id, a.plan_day_id, a.score, a.total, a.percentage, a.taken_at, "
-        "d.topic, d.day_number, p.id AS plan_id, p.title AS plan_title "
-        "FROM quiz_attempts a JOIN plan_days d ON d.id = a.plan_day_id "
-        "JOIN plans p ON p.id = d.plan_id "
-    )
-    params = ()
-    if plan_id is not None:
-        sql += "WHERE p.id = ? "
-        params = (plan_id,)
-    sql += "ORDER BY a.id DESC"
-    with get_connection() as conn:
-        return [dict(r) for r in conn.execute(sql, params).fetchall()]
+def delete_test_case(db_id: int, db_path=DB_PATH) -> bool:
+    """Delete one test case. Returns True if a row was deleted."""
+    with _connect(db_path) as conn:
+        return conn.execute("DELETE FROM test_cases WHERE id = ?", (db_id,)).rowcount > 0
 
 
-def get_attempt_detail(attempt_id):
-    with get_connection() as conn:
-        row = conn.execute("SELECT * FROM quiz_attempts WHERE id = ?", (attempt_id,)).fetchone()
-    if not row:
-        return None
-    attempt = dict(row)
-    attempt["answers"] = json.loads(attempt["answers"])
-    attempt["quiz"] = get_quiz(attempt["quiz_id"])
-    return attempt
+def delete_requirement(requirement_id: int, db_path=DB_PATH) -> bool:
+    """Delete a requirement and (through ON DELETE CASCADE) all of its test cases."""
+    with _connect(db_path) as conn:
+        return conn.execute("DELETE FROM requirements WHERE id = ?", (requirement_id,)).rowcount > 0
